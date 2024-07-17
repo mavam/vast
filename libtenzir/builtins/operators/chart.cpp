@@ -14,6 +14,7 @@
 #include <tenzir/detail/flat_map.hpp>
 #include <tenzir/parser_interface.hpp>
 #include <tenzir/plugin.hpp>
+#include <tenzir/tql2/plugin.hpp>
 #include <tenzir/variant.hpp>
 
 #include <ranges>
@@ -823,8 +824,51 @@ public:
   }
 };
 
+class plugin2 final : public operator_factory_plugin {
+public:
+  auto name() const -> std::string override {
+    return "tql2.chart";
+  }
+
+  auto make(invocation inv, session ctx) const
+    -> failure_or<operator_ptr> override {
+    auto kind_opt = std::optional<located<std::string>>{};
+    auto x = std::optional<ast::expression>{};
+    auto y = std::optional<ast::expression>{};
+    auto x_type = std::optional<located<std::string>>{};
+    auto y_type = std::optional<located<std::string>>{};
+    auto name = std::optional<ast::expression>{};
+    auto value = std::optional<ast::expression>{};
+    // TODO: Maybe make options dependant on `kind`.
+    auto parser = argument_parser2::operator_("chart")
+                    .add("kind", kind_opt)
+                    .add("x", x)
+                    .add("y", y)
+                    .add("x_type", x_type)
+                    .add("y_type", y_type)
+                    .add("name", name)
+                    .add("value", value);
+    parser.parse(inv, ctx).ignore();
+    if (not kind_opt) {
+      // TODO: Replace this with proper argument parser support.
+      diagnostic::error("named argument `kind` is required")
+        .primary(inv.self)
+        .usage(parser.usage())
+        .docs(parser.docs())
+        .emit(ctx);
+      return failure::promise();
+    }
+    auto kind = std::move(*kind_opt);
+    auto cfg = configuration{};
+    cfg.emplace_back("chart", attribute_value{std::move(kind.inner)});
+    // TODO: Continue.
+    return std::make_unique<chart_operator>(std::move(cfg));
+  }
+};
+
 } // namespace
 
 } // namespace tenzir::plugins::chart
 
 TENZIR_REGISTER_PLUGIN(tenzir::plugins::chart::plugin)
+TENZIR_REGISTER_PLUGIN(tenzir::plugins::chart::plugin2)
