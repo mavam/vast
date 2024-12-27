@@ -80,10 +80,10 @@ public:
         for (const auto& [_, count] : counts_) {
           const auto p_x = detail::narrow<double>(count) / total;
           if (p_x > 0.0) {
-            result -= p_x * std::log2(p_x);
+            result -= p_x * std::log(p_x);
           }
         }
-        return result;
+        return result / std::log(total);
       }
     }
     TENZIR_UNREACHABLE();
