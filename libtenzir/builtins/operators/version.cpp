@@ -6,7 +6,15 @@
 // SPDX-FileCopyrightText: (c) 2023 The Tenzir Contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
+#include "tenzir/compile_ctx.hpp"
+#include "tenzir/detail/weak_run_delayed.hpp"
+#include "tenzir/finalize_ctx.hpp"
+#include "tenzir/operator_actor.hpp"
+#include "tenzir/substitute_ctx.hpp"
+
 #include <tenzir/argument_parser.hpp>
+#include <tenzir/exec/pipeline.hpp>
+#include <tenzir/ir.hpp>
 #include <tenzir/plugin.hpp>
 #include <tenzir/series_builder.hpp>
 #include <tenzir/tql2/plugin.hpp>
@@ -14,6 +22,8 @@
 
 #include <arrow/util/config.h>
 #include <boost/version.hpp>
+#include <caf/actor_from_state.hpp>
+#include <caf/scheduled_actor/flow.hpp>
 #include <flatbuffers/base.h>
 #include <openssl/configuration.h>
 
@@ -157,8 +167,138 @@ public:
   }
 };
 
+class version_exec {
+public:
+  explicit version_exec(exec::operator_actor::pointer self,
+                        exec::operator_shutdown_actor operator_shutdown,
+                        exec::operator_stop_actor operator_stop)
+    : self_{self},
+      operator_shutdown_{std::move(operator_shutdown)},
+      operator_stop_{std::move(operator_stop)} {
+  }
+
+  auto make_behavior() -> exec::operator_actor::behavior_type {
+    return {
+      [this](exec::handshake hs) -> caf::result<exec::handshake_response> {
+        auto out
+          = self_->observe(as<exec::stream<void>>(hs.input), 30, 10)
+              .map([](exec::message<void> msg) -> exec::message<table_slice> {
+                return msg;
+              })
+              // TODO: Concat keeps order. We just want to inject, so merge?
+              .merge(self_->make_observable().just(
+                exec::message<table_slice>{table_slice{}}))
+              // TODO: This is quite bad.
+              .concat_map([this](exec::message<table_slice> message) {
+                // TODO: This should be sent after we send the table slice?
+                auto out = std::vector<exec::message<table_slice>>{};
+                if (is<table_slice>(message)) {
+                  TENZIR_WARN("version completed, notifying executor");
+                  self_
+                    ->mail(atom::done_v)
+                    // TODO: Timeout.
+                    .request(operator_shutdown_, std::chrono::seconds{1})
+                    .then(
+                      []() {
+                        TENZIR_WARN("shutdown notified");
+                      },
+                      [](caf::error err) {
+                        TENZIR_WARN("ERROR: {}", err);
+                      });
+                  out.reserve(2);
+                  out.push_back(std::move(message));
+                  out.emplace_back(exec::exhausted{});
+                  TENZIR_ASSERT(operator_stop_);
+                  self_->mail(atom::stop_v)
+                    .request(operator_stop_, caf::infinite)
+                    .then(
+                      [] {
+                        TENZIR_WARN("stop notified");
+                      },
+                      [](caf::error err) {
+                        TENZIR_WARN("ERROR: {}", err);
+                      });
+                } else {
+                  out.reserve(1);
+                  out.push_back(std::move(message));
+                }
+                return self_->make_observable().from_container(std::move(out));
+              })
+              .do_on_complete([] {
+                TENZIR_WARN("version stream terminated");
+              })
+              .to_typed_stream("version-exec", std::chrono::milliseconds{1}, 1);
+        return {std::move(out)};
+      },
+      [](exec::checkpoint) -> caf::result<void> {
+        // no post-commit logic here
+        return {};
+      },
+      [](atom::stop) -> caf::result<void> {
+        // No need to react, we are one-shot anyway.
+        return {};
+      },
+    };
+  }
+
+private:
+  exec::operator_actor::pointer self_;
+  exec::operator_shutdown_actor operator_shutdown_;
+  exec::operator_stop_actor operator_stop_;
+};
+
+class version_bp final : public bp::operator_base {
+public:
+  version_bp() = default;
+
+  auto name() const -> std::string override {
+    return "version_bp";
+  }
+
+  auto spawn(spawn_args args) const -> exec::operator_actor override {
+    return args.sys.spawn<caf::detached>(caf::actor_from_state<version_exec>,
+                                         args.operator_shutdown,
+                                         args.operator_stop);
+  }
+
+  friend auto inspect(auto& f, version_bp& x) -> bool {
+    return f.object(x).fields();
+  }
+};
+
+class version_ir final : public ir::operator_base {
+public:
+  version_ir() = default;
+
+  auto name() const -> std::string override {
+    return "version_ir";
+  }
+
+  auto substitute(substitute_ctx ctx, bool instantiate)
+    -> failure_or<void> override {
+    TENZIR_UNUSED(ctx, instantiate);
+    return {};
+  }
+
+  auto finalize(finalize_ctx ctx) && -> failure_or<bp::pipeline> override {
+    TENZIR_UNUSED(ctx);
+    return std::make_unique<version_bp>();
+  }
+
+  auto infer_type(operator_type2 input, diagnostic_handler&) const
+    -> failure_or<std::optional<operator_type2>> override {
+    TENZIR_ASSERT(input == tag_v<void>);
+    return tag_v<table_slice>;
+  }
+
+  friend auto inspect(auto& f, version_ir& x) -> bool {
+    return f.object(x).fields();
+  }
+};
+
 class plugin final : public virtual operator_plugin<version_operator>,
-                     operator_factory_plugin {
+                     public virtual operator_factory_plugin,
+                     public virtual operator_compiler_plugin {
 public:
   auto signature() const -> operator_signature override {
     return {.source = true};
@@ -176,6 +316,14 @@ public:
     argument_parser2::operator_("version").parse(inv, ctx).ignore();
     return std::make_unique<version_operator>();
   }
+
+  auto compile(ast::invocation inv, compile_ctx ctx) const
+    -> failure_or<ir::operator_ptr> override {
+    // TODO
+    TENZIR_UNUSED(ctx);
+    TENZIR_ASSERT(inv.args.empty());
+    return std::make_unique<version_ir>();
+  }
 };
 
 } // namespace
@@ -183,3 +331,9 @@ public:
 } // namespace tenzir::plugins::version
 
 TENZIR_REGISTER_PLUGIN(tenzir::plugins::version::plugin)
+TENZIR_REGISTER_PLUGIN(
+  tenzir::inspection_plugin<tenzir::ir::operator_base,
+                            tenzir::plugins::version::version_ir>);
+TENZIR_REGISTER_PLUGIN(
+  tenzir::inspection_plugin<tenzir::bp::operator_base,
+                            tenzir::plugins::version::version_bp>);
