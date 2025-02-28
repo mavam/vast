@@ -25,6 +25,7 @@
 #include <arrow/util/byte_size.h>
 #include <caf/actor_addr.hpp>
 #include <caf/actor_from_state.hpp>
+#include <caf/actor_registry.hpp>
 #include <caf/anon_mail.hpp>
 #include <caf/exit_reason.hpp>
 #include <caf/typed_event_based_actor.hpp>
@@ -259,6 +260,23 @@ struct exec_node_state {
             std::rethrow_exception(exception);
           } catch (diagnostic& diag) {
             return std::move(diag).to_error();
+          } catch (panic_exception& panic) {
+            auto has_node
+              = self->system().registry().get("tenzir.node") != nullptr;
+            auto diagnostic = to_diagnostic(panic);
+            if (has_node) {
+              auto buffer = std::stringstream{};
+              buffer << "panic in execution node\n";
+              auto printer = make_diagnostic_printer(
+                std::nullopt, color_diagnostics::no, buffer);
+              printer->emit(diagnostic);
+              auto string = std::move(buffer).str();
+              if (not string.empty() and string.back() == '\n') {
+                string.pop_back();
+              }
+              TENZIR_ERROR(string);
+            }
+            return std::move(diagnostic).to_error();
           } catch (const std::exception& err) {
             return diagnostic::error("{}", err.what())
               .note("unhandled exception in {} {}", *self, op->name())
@@ -569,7 +587,7 @@ struct exec_node_state {
     return {};
   }
 
-  auto advance_generator() -> void {
+  TENZIR_NO_INLINE auto advance_generator() -> void {
     auto time_processing_guard = make_timer_guard(metrics.time_processing);
     if constexpr (std::is_same_v<Output, std::monostate>) {
       // We never issue demand to the sink, so we cannot be at the end of the
